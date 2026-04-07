@@ -1,0 +1,65 @@
+{
+  "paper_config": {
+    "description": "Configuración estendar para experimentos del paper",
+    "datasets": ["hymenoptera", "brain_tumor", "cats_dogs", "solar_dust"],
+    "models": ["resnet18", "resnet34", "vgg19", "mobilenetv2"],
+    "epochs": 10,
+    "batch_size": 16,
+    "learning_rate": 0.001,
+    "n_qubits": 4,
+    "quantum_depth": 3,
+    "approaches": ["classical", "qiskit", "qiskit_noisy", "pennylane", "pennylane_noisy"]
+  },
+  
+  "quick_test": {
+    "description": "Configuración rapida para pruebas (1 epoca, 1 dataset)",
+    "datasets": ["hymenoptera"],
+    "models": ["resnet18"],
+    "epochs": 1,
+    "batch_size": 8,
+    "learning_rate": 0.001,
+    "n_qubits": 4,
+    "quantum_depth": 3,
+    "approaches": ["classical", "pennylane"]
+  },
+  
+  "quantum_focus": {
+    "description": "Solo modelos cuanticos para comparar frameworks",
+    "datasets": ["hymenoptera", "brain_tumor"],
+    "models": ["resnet18", "resnet34"],
+    "epochs": 5,
+    "batch_size": 16,
+    "learning_rate": 0.001,
+    "n_qubits": 4,
+    "quantum_depth": 3,
+    "approaches": ["qiskit", "qiskit_noisy", "pennylane", "pennylane_noisy"]
+  },
+  
+  "noise_comparison": {
+    "description": "Comparar modelos perfectos vs con ruido IBM",
+    "datasets": ["hymenoptera"],
+    "models": ["resnet18", "vgg19"],
+    "epochs": 10,
+    "batch_size": 16,
+    "learning_rate": 0.001,
+    "n_qubits": 4,
+    "quantum_depth": 3,
+    "approaches": ["qiskit", "qiskit_noisy", "pennylane", "pennylane_noisy"]
+  },
+  
+  "ablation_study": {
+    "description": "Estudio de ablacion con diferentes configuraciones cuanticas",
+    "datasets": ["hymenoptera"],
+    "models": ["resnet18"],
+    "epochs": 5,
+    "batch_size": 16,
+    "learning_rate": 0.001,
+    "quantum_configs": [
+      {"n_qubits": 2, "quantum_depth": 2},
+      {"n_qubits": 4, "quantum_depth": 2}, 
+      {"n_qubits": 4, "quantum_depth": 3},
+      {"n_qubits": 8, "quantum_depth": 3}
+    ],
+    "approaches": ["pennylane"]
+  }
+}
