@@ -375,11 +375,15 @@ def replace_classifier(model, model_name, quantum_head):
         raise ValueError("Unsupported model for quantum hybrid. Use 'resnet18', 'resnet34', 'vgg19', or 'mobilenetv2'.")
     return model
 
-def train_quantum_hybrid_qiskit_noisy(dataset_file="hymenoptera", classical_model="resnet18", n_qubits=4, quantum_depth=3, epochs=20, id="null", batch_size=32, learning_rate=0.001, gamma=0.9, backend_name='ibm_nairobi', seed=42, output_dir=None, use_zne=True, zne_scale_factors=None):
+def train_quantum_hybrid_qiskit_noisy(dataset_file="hymenoptera", classical_model="resnet18", n_qubits=4, quantum_depth=3, epochs=20, id="null", batch_size=32, learning_rate=0.001, gamma=0.9, backend_name='ibm_nairobi', seed=42, output_dir=None, use_zne=True, zne_scale_factors=None, checkpoint_dir=None):
     """
     Train a quantum hybrid model with realistic noise from IBM quantum devices.
     """
     set_seed(seed)
+    if checkpoint_dir is None:
+        checkpoint_dir = os.path.join("checkpoints", id)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"Checkpoints will be saved to: {checkpoint_dir}")
     print("============================================================")
     print("Qiskit Noisy Quantum Transfer Learning")
     print("============================================================")
@@ -475,6 +479,7 @@ def train_quantum_hybrid_qiskit_noisy(dataset_file="hymenoptera", classical_mode
         )
         tracker.start()
     loss_hist = []
+    val_losses = []
     acc_hist = []
     def evaluate(loader):
         hybrid_model.eval()
@@ -507,25 +512,82 @@ def train_quantum_hybrid_qiskit_noisy(dataset_file="hymenoptera", classical_mode
             running_loss += loss.item()
         scheduler.step()
         val_acc = evaluate(val_loader)
+        # Compute validation loss
+        hybrid_model.eval()
+        v_run_loss = 0.0
+        v_batches = 0
+        with torch.no_grad():
+            for vx, vy in val_loader:
+                vx, vy = vx.to(device), vy.to(device)
+                vout = hybrid_model(vx)
+                vloss = criterion(vout, vy)
+                v_run_loss += vloss.item()
+                v_batches += 1
+        epoch_val_loss = v_run_loss / v_batches if v_batches else 0.0
         loss_hist.append(running_loss / len(train_loader))
+        val_losses.append(epoch_val_loss)
         acc_hist.append(val_acc)
         print(f"Epoch {epoch}/{epochs} - Loss: {running_loss/len(train_loader):.4f}, Val Acc: {val_acc:.4f}")
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_weights = copy.deepcopy(hybrid_model.state_dict())
             best_epoch = epoch
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': hybrid_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': loss_hist[-1],
+            'val_loss': val_losses[-1],
+            'val_acc': acc_hist[-1],
+            'best_val_acc': best_val_acc,
+            'config': {
+                'dataset': dataset_file,
+                'backbone': classical_model,
+                'n_qubits': n_qubits,
+                'depth': quantum_depth,
+                'seed': seed,
+            }
+        }
+        ckpt_path = os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pt")
+        torch.save(checkpoint, ckpt_path)
     train_time = time.time() - start_train
     hybrid_model.load_state_dict(best_weights)
     print(f"Best Validation Accuracy: {best_val_acc:.2%} at Epoch {best_epoch}")
     print(f"Total Training Time: {train_time:.2f} seconds")
 
     print("Step 6/7: Evaluating model on test set...")
-    
+
     start_test = time.time()
     test_acc = evaluate(test_loader)
     test_time = time.time() - start_test
     print(f"Test Accuracy: {test_acc:.2%}")
     print(f"Test Evaluation Time: {test_time:.2f} seconds")
+
+    os.makedirs("model_saved", exist_ok=True)
+    final_model_path = os.path.join("model_saved", f"{id}_final.pt")
+    torch.save({
+        'model_state_dict': hybrid_model.state_dict(),
+        'training_complete': True,
+        'best_val_acc': best_val_acc,
+        'best_epoch': best_epoch,
+        'test_acc': test_acc,
+        'train_time_s': train_time,
+        'epochs_trained': len(loss_hist),
+        'loss_history': loss_hist,
+        'val_loss_history': val_losses,
+        'val_acc_history': acc_hist,
+        'config': {
+            'dataset': dataset_file,
+            'backbone': classical_model,
+            'n_qubits': n_qubits,
+            'quantum_depth': quantum_depth,
+            'seed': seed,
+            'approach': 'qiskit_noisy',
+            'shots': shots if 'shots' in dir() else None,
+            'backend_name': backend_name,
+        }
+    }, final_model_path)
+    print(f"Final model saved: {final_model_path}")
 
     # ---- Zero-Noise Extrapolation (ZNE) ----
     # ZNE is applied post-training during evaluation only. The model is trained
@@ -827,6 +889,8 @@ def main():
     parser.add_argument('--id', type=str, help='Run identifier (auto if not provided)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--output-dir', type=str, default=None, help='Output directory for results CSV')
+    parser.add_argument('--checkpoint-dir', type=str, default=None,
+                       help='Directory for per-epoch checkpoints (default: checkpoints/<run_id>)')
     parser.add_argument('--use-zne', type=bool, default=True, help='Enable Zero-Noise Extrapolation during evaluation (default: True)')
     parser.add_argument('--zne-scale-factors', type=str, default='1.0,2.0,3.0',
                        help='Comma-separated noise scale factors for ZNE (default: "1.0,2.0,3.0")')
@@ -856,7 +920,8 @@ def main():
         seed=args.seed,
         output_dir=args.output_dir,
         use_zne=args.use_zne,
-        zne_scale_factors=zne_scale_factors
+        zne_scale_factors=zne_scale_factors,
+        checkpoint_dir=args.checkpoint_dir
     )
 
 if __name__ == "__main__":

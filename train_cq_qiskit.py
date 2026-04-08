@@ -227,8 +227,12 @@ def train_quantum_hybrid_qiskit(dataset_file="hymenoptera", classical_model="res
                                 epochs=20, id="null", batch_size=32, learning_rate=0.001, gamma=0.9,
                                 shots: int | None = None, use_noise: bool = False,
                                 noise_1q: float = 0.0, noise_2q: float = 0.0,
-                                seed=42, output_dir=None):
+                                seed=42, output_dir=None, checkpoint_dir=None):
     set_seed(seed)
+    if checkpoint_dir is None:
+        checkpoint_dir = os.path.join("checkpoints", id)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"Checkpoints will be saved to: {checkpoint_dir}")
     print("============================================================")
     print("Qiskit Quantum Transfer Learning")
     print("============================================================")
@@ -369,6 +373,24 @@ def train_quantum_hybrid_qiskit(dataset_file="hymenoptera", classical_model="res
         print(f"Epoch {ep}/{epochs} - train_loss={epoch_train_loss:.4f} val_loss={epoch_val_loss:.4f} val_acc={vacc:.4f}")
         if vacc > best_acc:
             best_acc, best_w, best_ep = vacc, copy.deepcopy(hybrid.state_dict()), ep
+        checkpoint = {
+            'epoch': ep,
+            'model_state_dict': hybrid.state_dict(),
+            'optimizer_state_dict': opt.state_dict(),
+            'train_loss': losses[-1],
+            'val_loss': val_losses[-1],
+            'val_acc': val_accs[-1],
+            'best_val_acc': best_acc,
+            'config': {
+                'dataset': dataset_file,
+                'backbone': classical_model,
+                'n_qubits': n_qubits,
+                'depth': quantum_depth,
+                'seed': seed,
+            }
+        }
+        ckpt_path = os.path.join(checkpoint_dir, f"epoch_{ep:03d}.pt")
+        torch.save(checkpoint, ckpt_path)
     train_time = time.time() - t0
     hybrid.load_state_dict(best_w)
     print(f"Best val_acc={best_acc:.2%} epoch={best_ep}")
@@ -382,6 +404,29 @@ def train_quantum_hybrid_qiskit(dataset_file="hymenoptera", classical_model="res
     print("Step 7/7: Saving model and comprehensive metrics...")
     os.makedirs("model_saved", exist_ok=True)
     torch.save(hybrid.state_dict(), os.path.join("model_saved", f"CQ_{id}_{classical_model}_{dataset_file}.pth"))
+    final_model_path = os.path.join("model_saved", f"{id}_final.pt")
+    torch.save({
+        'model_state_dict': hybrid.state_dict(),
+        'training_complete': True,
+        'best_val_acc': best_acc,
+        'best_epoch': best_ep,
+        'test_acc': test_acc,
+        'train_time_s': train_time,
+        'epochs_trained': len(losses),
+        'loss_history': losses,
+        'val_loss_history': val_losses,
+        'val_acc_history': val_accs,
+        'config': {
+            'dataset': dataset_file,
+            'backbone': classical_model,
+            'n_qubits': n_qubits,
+            'quantum_depth': quantum_depth,
+            'seed': seed,
+            'approach': 'qiskit_ideal',
+            'shots': shots if 'shots' in dir() else None,
+        }
+    }, final_model_path)
+    print(f"Final model saved: {final_model_path}")
 
     metrics_dir = os.path.join("static", "metrics")
     os.makedirs(metrics_dir, exist_ok=True)
@@ -484,6 +529,8 @@ def _build_arg_parser():
     p.add_argument('--id', default=None, help='Run identifier (auto-generated if not provided)')
     p.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     p.add_argument('--output-dir', type=str, default=None, help='Output directory for results CSV')
+    p.add_argument('--checkpoint-dir', type=str, default=None,
+                   help='Directory for per-epoch checkpoints (default: checkpoints/<run_id>)')
     return p
 
 if __name__ == '__main__':
@@ -506,5 +553,6 @@ if __name__ == '__main__':
         noise_1q=args.noise_1q,
         noise_2q=args.noise_2q,
         seed=args.seed,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        checkpoint_dir=args.checkpoint_dir
     )

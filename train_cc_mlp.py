@@ -252,8 +252,14 @@ def train_mlp(
     seed: int,
     run_id: str,
     output_dir: str,
+    checkpoint_dir=None,
 ):
     set_seed(seed)
+    # Checkpoint directory setup
+    if checkpoint_dir is None:
+        checkpoint_dir = os.path.join("checkpoints", run_id)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"Checkpoints will be saved to: {checkpoint_dir}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("=" * 60)
@@ -371,6 +377,25 @@ def train_mlp(
         loss_history.append(avg_loss)
         val_acc_history.append(val_acc)
         print(f"  Epoch {epoch}/{epochs} -- Loss: {avg_loss:.4f}, Val Acc: {val_acc:.4f}")
+        # Save epoch checkpoint
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': loss_history[-1],
+            'val_acc': val_acc,
+            'args': {
+                'dataset': dataset_file,
+                'model': classical_model,
+                'seed': seed,
+                'epochs': epochs,
+                'batch_size': batch_size,
+                'learning_rate': learning_rate,
+            }
+        }
+        ckpt_path = os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pt")
+        torch.save(checkpoint, ckpt_path)
+        print(f"  Checkpoint saved: {ckpt_path}")
 
     train_time = time.time() - start_train
 
@@ -449,6 +474,30 @@ def train_mlp(
     model_path = os.path.join(model_dir, f"CC_MLP_{run_id}_{classical_model}_{dataset_file}.pth")
     torch.save(model.state_dict(), model_path)
     print(f"  Model saved: {model_path}")
+    # Save final model with full metadata
+    os.makedirs("model_saved", exist_ok=True)
+    final_model_path = os.path.join("model_saved", f"{run_id}_final.pt")
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'training_complete': True,
+        'best_val_acc': max(val_acc_history) if val_acc_history else 0.0,
+        'test_acc': test_acc,
+        'train_time_s': train_time,
+        'epochs_trained': len(loss_history),
+        'loss_history': loss_history,
+        'val_acc_history': val_acc_history,
+        'config': {
+            'dataset': dataset_file,
+            'backbone': classical_model,
+            'seed': seed,
+            'epochs': epochs,
+            'batch_size': batch_size,
+            'learning_rate': learning_rate,
+            'head_type': head_type,
+        }
+    }, final_model_path)
+    print(f"Final model saved: {final_model_path}")
 
     # ---- Plots ----
     epochs_range = list(range(1, len(loss_history) + 1))
@@ -590,6 +639,8 @@ def main():
                    help='Base output directory (for SLURM / cluster runs)')
     p.add_argument('--id', default=None,
                    help='Run identifier (auto-generated if not provided)')
+    p.add_argument('--checkpoint-dir', type=str, default=None,
+                   help='Directory to save per-epoch checkpoints (default: checkpoints/<run_id>)')
     args = p.parse_args()
 
     # Auto-generate ID
@@ -608,6 +659,7 @@ def main():
             seed=args.seed,
             run_id=args.id,
             output_dir=args.output_dir,
+            checkpoint_dir=args.checkpoint_dir,
         )
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

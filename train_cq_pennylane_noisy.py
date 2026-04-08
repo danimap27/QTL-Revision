@@ -377,7 +377,7 @@ def train_quantum_hybrid_pennylane_noisy(dataset_file="hymenoptera", classical_m
                                        batch_size=32, learning_rate=1e-3, early_stop_patience=10,
                                        gamma=0.9, noise_type='realistic_ibm', backend='ibm_nairobi',
                                        seed=42, output_dir=None,
-                                       use_zne=True, zne_scale_factors=None):
+                                       use_zne=True, zne_scale_factors=None, checkpoint_dir=None):
     set_seed(seed)
     print("============================================================")
     print("PennyLane Noisy Quantum Transfer Learning")
@@ -400,7 +400,11 @@ def train_quantum_hybrid_pennylane_noisy(dataset_file="hymenoptera", classical_m
     print(f"ID: {id}")
     print("============================================================")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+    if checkpoint_dir is None:
+        checkpoint_dir = os.path.join("checkpoints", id)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"Checkpoints will be saved to: {checkpoint_dir}")
+
     print("Step 1/7: Loading and preparing datasets...")
     # Robust dataset path resolution
     def _resolve_dataset_dir(name: str):
@@ -540,7 +544,24 @@ def train_quantum_hybrid_pennylane_noisy(dataset_file="hymenoptera", classical_m
         val_accs.append(val_acc)
         
         print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-        
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': train_losses[-1],
+            'val_loss': val_losses[-1],
+            'val_acc': val_accs[-1],
+            'config': {
+                'dataset': dataset_file,
+                'backbone': classical_model,
+                'n_qubits': n_qubits,
+                'depth': quantum_depth,
+                'seed': seed,
+            }
+        }
+        ckpt_path = os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pt")
+        torch.save(checkpoint, ckpt_path)
+
         scheduler.step()
         
         # Early stopping
@@ -608,6 +629,28 @@ def train_quantum_hybrid_pennylane_noisy(dataset_file="hymenoptera", classical_m
     os.makedirs('model_saved', exist_ok=True)
     fn = f"PL_NOISY_{id}_{classical_model}_{dataset_file}.pth"
     torch.save(model.state_dict(), os.path.join('model_saved', fn))
+    final_model_path = os.path.join("model_saved", f"{id}_final.pt")
+    torch.save({
+        'model_state_dict': best_model,
+        'training_complete': True,
+        'best_val_acc': max(val_accs) if val_accs else 0.0,
+        'test_acc': test_acc,
+        'train_time_s': train_time,
+        'epochs_trained': len(train_losses),
+        'loss_history': train_losses,
+        'val_loss_history': val_losses,
+        'val_acc_history': val_accs,
+        'config': {
+            'dataset': dataset_file,
+            'backbone': classical_model,
+            'n_qubits': n_qubits,
+            'quantum_depth': quantum_depth,
+            'seed': seed,
+            'noise_type': noise_type,
+            'approach': 'pennylane_noisy',
+        }
+    }, final_model_path)
+    print(f"Final model saved: {final_model_path}")
 
     # Professional visualization
     metrics_dir = os.path.join("static", "metrics")
@@ -822,6 +865,8 @@ def main():
     parser.add_argument('--id', type=str, help='Run identifier (auto if not provided)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--output-dir', type=str, default=None, help='Output directory for results CSV')
+    parser.add_argument('--checkpoint-dir', type=str, default=None,
+                       help='Directory for per-epoch checkpoints (default: checkpoints/<run_id>)')
     parser.add_argument('--use-zne', action='store_true', default=True,
                        help='Enable Zero-Noise Extrapolation (ZNE) for error mitigation (default: True)')
     parser.add_argument('--no-zne', action='store_false', dest='use_zne',
@@ -856,7 +901,8 @@ def main():
         seed=args.seed,
         output_dir=args.output_dir,
         use_zne=args.use_zne,
-        zne_scale_factors=zne_scale_factors
+        zne_scale_factors=zne_scale_factors,
+        checkpoint_dir=args.checkpoint_dir
     )
 
 if __name__ == "__main__":

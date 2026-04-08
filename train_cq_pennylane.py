@@ -111,7 +111,7 @@ class HybridModel(nn.Module):
         outs = [self.qlayer(xi) for xi in x]
         return torch.stack(outs, dim=0)
 
-def train_quantum_hybrid_pennylane(dataset_file, classical_model, n_qubits, epochs, id, batch_size=32, learning_rate=1e-3, early_stop_patience=10, quantum_depth=3, gamma=0.9, seed=42, output_dir=None):
+def train_quantum_hybrid_pennylane(dataset_file, classical_model, n_qubits, epochs, id, batch_size=32, learning_rate=1e-3, early_stop_patience=10, quantum_depth=3, gamma=0.9, seed=42, output_dir=None, checkpoint_dir=None):
     set_seed(seed)
     print("============================================================")
     print("PennyLane Quantum Transfer Learning")
@@ -126,6 +126,10 @@ def train_quantum_hybrid_pennylane(dataset_file, classical_model, n_qubits, epoc
     print(f"ID: {id}")
     print("============================================================")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if checkpoint_dir is None:
+        checkpoint_dir = os.path.join("checkpoints", id)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"Checkpoints will be saved to: {checkpoint_dir}")
     # Robust dataset path resolution
     def _resolve_dataset_dir(name: str):
         script_root = os.path.dirname(os.path.abspath(__file__))
@@ -245,11 +249,28 @@ def train_quantum_hybrid_pennylane(dataset_file, classical_model, n_qubits, epoc
         val_losses.append(val_loss)
         val_accs.append(acc)
         print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {acc:.4f}")
-        if val_loss < best_loss: 
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': train_losses[-1],
+            'val_loss': val_losses[-1],
+            'val_acc': val_accs[-1],
+            'config': {
+                'dataset': dataset_file,
+                'backbone': classical_model,
+                'n_qubits': n_qubits,
+                'depth': quantum_depth,
+                'seed': seed,
+            }
+        }
+        ckpt_path = os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pt")
+        torch.save(checkpoint, ckpt_path)
+        if val_loss < best_loss:
             best_loss, patience = val_loss, 0
-        else: 
-            patience += 1                       
-        if patience >= early_stop_patience: 
+        else:
+            patience += 1
+        if patience >= early_stop_patience:
             break
 
     train_time = time.time() - start_time
@@ -278,6 +299,27 @@ def train_quantum_hybrid_pennylane(dataset_file, classical_model, n_qubits, epoc
     os.makedirs('model_saved', exist_ok=True)
     fn = f"PL_{id}_{classical_model}_{dataset_file}.pth"
     torch.save(model.state_dict(), os.path.join('model_saved', fn))
+    final_model_path = os.path.join("model_saved", f"{id}_final.pt")
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'training_complete': True,
+        'best_val_acc': max(val_accs) if val_accs else 0.0,
+        'test_acc': test_acc,
+        'train_time_s': train_time,
+        'epochs_trained': len(train_losses),
+        'loss_history': train_losses,
+        'val_loss_history': val_losses,
+        'val_acc_history': val_accs,
+        'config': {
+            'dataset': dataset_file,
+            'backbone': classical_model,
+            'n_qubits': n_qubits,
+            'quantum_depth': quantum_depth,
+            'seed': seed,
+            'approach': 'pennylane_ideal',
+        }
+    }, final_model_path)
+    print(f"Final model saved: {final_model_path}")
 
     # Get predictions and probabilities for ROC curves
     model.eval()
@@ -454,6 +496,8 @@ def main():
     p.add_argument('--id', default=None, help='Run identifier (auto if not provided)')
     p.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     p.add_argument('--output-dir', type=str, default=None, help='Output directory for results CSV')
+    p.add_argument('--checkpoint-dir', type=str, default=None,
+                   help='Directory for per-epoch checkpoints (default: checkpoints/<run_id>)')
     args = p.parse_args()
 
     # Generate ID if not provided
@@ -488,7 +532,8 @@ def main():
             quantum_depth=args.depth,
             gamma=args.gamma,
             seed=args.seed,
-            output_dir=args.output_dir
+            output_dir=args.output_dir,
+            checkpoint_dir=args.checkpoint_dir
         )
         
         print("=" * 60)

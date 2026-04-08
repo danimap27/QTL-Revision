@@ -61,8 +61,13 @@ def resolve_dataset(dataset_name):
                 return dataset_name, n_classes
         raise ValueError(f"Dataset {dataset_name} not found")
 
-def train_classical(dataset_file="hymenoptera", classical_model="resnet18", epochs=5, id="null", batch_size=16, learning_rate=1e-4, seed=42, output_dir=None):
+def train_classical(dataset_file="hymenoptera", classical_model="resnet18", epochs=5, id="null", batch_size=16, learning_rate=1e-4, seed=42, output_dir=None, checkpoint_dir=None):
     set_seed(seed)
+    # Checkpoint directory setup
+    if checkpoint_dir is None:
+        checkpoint_dir = os.path.join("checkpoints", id)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"Checkpoints will be saved to: {checkpoint_dir}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print("============================================================")
@@ -192,6 +197,25 @@ def train_classical(dataset_file="hymenoptera", classical_model="resnet18", epoc
         loss_hist.append(running_loss / len(train_loader))
         acc_hist.append(val_acc)
         print(f"Epoch {epoch+1}/{epochs} - Loss: {running_loss/len(train_loader):.4f}, Val Acc: {val_acc:.4f}")
+        # Save epoch checkpoint
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': loss_hist[-1],
+            'val_acc': val_acc,
+            'args': {
+                'dataset': dataset_file,
+                'model': classical_model,
+                'seed': seed,
+                'epochs': epochs,
+                'batch_size': batch_size,
+                'learning_rate': learning_rate,
+            }
+        }
+        ckpt_path = os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pt")
+        torch.save(checkpoint, ckpt_path)
+        print(f"  Checkpoint saved: {ckpt_path}")
     train_time = time.time() - start_train
     
     final_val_acc = evaluate(val_loader)
@@ -209,6 +233,28 @@ def train_classical(dataset_file="hymenoptera", classical_model="resnet18", epoc
     model_path = os.path.join("model_saved", f"CC_{id}_{classical_model}_{dataset_file}.pth")
     torch.save(model.state_dict(), model_path)
     print(f"Model saved to {model_path}")
+    # Save final model with full metadata
+    final_model_path = os.path.join("model_saved", f"{id}_final.pt")
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'training_complete': True,
+        'best_val_acc': max(acc_hist) if acc_hist else 0.0,
+        'test_acc': test_acc,
+        'train_time_s': train_time,
+        'epochs_trained': len(loss_hist),
+        'loss_history': loss_hist,
+        'val_acc_history': acc_hist,
+        'config': {
+            'dataset': dataset_file,
+            'backbone': classical_model,
+            'seed': seed,
+            'epochs': epochs,
+            'batch_size': batch_size,
+            'learning_rate': learning_rate,
+        }
+    }, final_model_path)
+    print(f"Final model saved: {final_model_path}")
 
     print("Step 7/7: Saving comprehensive metrics...")
     metrics_dir = os.path.join("static","metrics")
@@ -396,6 +442,8 @@ def main():
     p.add_argument('--id', default=None, help='Run identifier (auto if not provided)')
     p.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     p.add_argument('--output-dir', type=str, default=None, help='Output directory for results CSV')
+    p.add_argument('--checkpoint-dir', type=str, default=None,
+                   help='Directory to save per-epoch checkpoints (default: checkpoints/<run_id>)')
     args = p.parse_args()
 
     # Generate ID if not provided
@@ -424,7 +472,8 @@ def main():
             batch_size=args.batch_size,
             learning_rate=args.lr,
             seed=args.seed,
-            output_dir=args.output_dir
+            output_dir=args.output_dir,
+            checkpoint_dir=args.checkpoint_dir
         )
         
         print("=" * 60)
