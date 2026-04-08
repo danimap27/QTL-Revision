@@ -17,7 +17,7 @@ import sys
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from runner import load_config, generate_runs, get_completed_run_ids
+from runner import load_config, generate_all_runs, get_completed_run_ids
 
 
 def main():
@@ -28,7 +28,7 @@ def main():
     args = parser.parse_args()
 
     config = load_config(args.config)
-    all_runs = generate_runs(config)
+    all_runs = generate_all_runs(config)
     output_dir = config.get("output_dir", "./results")
     completed = get_completed_run_ids(output_dir)
     pending = [r for r in all_runs if r["run_id"] not in completed]

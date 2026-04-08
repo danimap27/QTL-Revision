@@ -260,7 +260,8 @@ def train_and_evaluate(run_cfg, config):
         last_ckpt = os.path.join(run_ckpt_dir, ckpt_files[-1])
         ckpt = torch.load(last_ckpt, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if not use_spsa:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_epoch = ckpt["epoch"] + 1
         print(f"  Resuming from epoch {start_epoch}")
 
