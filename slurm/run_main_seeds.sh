@@ -18,8 +18,8 @@
 set -euo pipefail
 
 # Load modules
-module load Python/3.10.8-GCCcore-12.2.0
-module load CUDA/12.1.1
+module load Miniconda3
+
 conda activate qtl_revision
 
 cd $SLURM_SUBMIT_DIR
