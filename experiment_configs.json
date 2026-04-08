@@ -70,10 +70,14 @@
     "epochs": 10,
     "batch_size": 16,
     "learning_rate": 0.001,
-    "n_qubits": 4,
-    "quantum_depth": 3,
+    "qubit_configs": [4, 8, 16],
+    "depth_configs": [1, 3, 5],
     "seeds": [42, 123, 456, 789, 1024],
-    "approaches": ["classical", "classical_mlp_matched", "classical_mlp_standard", "pennylane_ideal", "pennylane_noisy", "qiskit_ideal", "qiskit_noisy"]
+    "zne": true,
+    "zne_scale_factors": [1.0, 2.0, 3.0],
+    "approaches": ["classical", "classical_mlp_matched", "classical_mlp_standard", "pennylane_ideal", "pennylane_noisy", "qiskit_ideal", "qiskit_noisy"],
+    "total_runs": 3120,
+    "notes": "240 classical + 2880 quantum (4 approaches x 4 backbones x 4 datasets x 3 qubits x 3 depths x 5 seeds)"
   },
 
   "revision_ablation": {

@@ -15,7 +15,7 @@ echo ""
 # Create log directory
 mkdir -p slurm_logs
 
-echo "Submitting main seed experiments (560 jobs)..."
+echo "Submitting main experiments (3120 jobs: 240 classical + 2880 quantum)..."
 JOB1=$(sbatch --parsable slurm/run_main_seeds.sh)
 echo "  Job ID: $JOB1"
 
@@ -44,7 +44,7 @@ echo "============================================"
 echo "  All jobs submitted!"
 echo "============================================"
 echo ""
-echo "Total tasks: 560 + 400 + 20 + 25 + 40 + 1 = 1046"
+echo "Total tasks: 3120 + 400 + 20 + 25 + 40 + 1 = 3606"
 echo ""
 echo "Monitor with:    squeue -u $USER"
 echo "Job details:     sacct -j $JOB1 --format=JobID,State,Elapsed,MaxRSS"

@@ -30,6 +30,7 @@ try:
 except ImportError:
     CODECARBON_AVAILABLE = False
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
+from scipy.optimize import curve_fit
 
 
 def set_seed(seed):
@@ -229,6 +230,89 @@ def quantum_circuit_with_noise(n_qubits, quantum_depth, noise_params=None):
     
     return circuit
 
+def scale_noise_params(noise_params, scale_factor):
+    """Scale all noise probabilities by scale_factor."""
+    scaled = {}
+    for key, val in noise_params.items():
+        if isinstance(val, dict):
+            scaled[key] = {}
+            for k, v in val.items():
+                if 'damping' in k or 'error' in k:
+                    # Scale noise probabilities, clamping to [0, 1)
+                    scaled[key][k] = min(v * scale_factor, 0.99)
+                else:
+                    scaled[key][k] = v
+        elif key == 'readout_errors':
+            scaled[key] = [min(e * scale_factor, 0.99) for e in val]
+        else:
+            scaled[key] = val
+    return scaled
+
+
+def richardson_extrapolate(scale_factors, values):
+    """Richardson extrapolation to zero noise.
+
+    For scale factors [c1, c2, c3, ...] and corresponding values [v1, v2, v3, ...],
+    fit a polynomial and evaluate at scale=0.
+    """
+    scale_factors = np.array(scale_factors)
+    values = np.array(values)
+
+    # Fit polynomial of degree len(scale_factors)-1
+    degree = min(len(scale_factors) - 1, 2)
+    coeffs = np.polyfit(scale_factors, values, degree)
+    # Evaluate at scale=0
+    return np.polyval(coeffs, 0.0)
+
+
+def apply_zne_to_predictions(model, test_loader, noise_params, n_qubits, quantum_depth,
+                              scale_factors, device, num_classes):
+    """Apply Zero-Noise Extrapolation to test predictions.
+
+    For each noise scale factor, create a new quantum circuit with scaled noise,
+    run test predictions, then extrapolate to zero noise.
+    """
+    all_scaled_probs = []  # shape: [n_scales, n_samples, n_classes]
+
+    for scale in scale_factors:
+        # Scale noise parameters
+        scaled_params = scale_noise_params(noise_params, scale)
+
+        # Create model with scaled noise
+        scaled_circuit = quantum_circuit_with_noise(n_qubits, quantum_depth, scaled_params)
+
+        # Replace quantum circuit in model temporarily
+        original_circuit = model.quantum_layer.quantum_circuit
+        model.quantum_layer.quantum_circuit = scaled_circuit
+
+        # Run predictions
+        probs = []
+        model.eval()
+        with torch.no_grad():
+            for x, y in test_loader:
+                x = x.to(device)
+                out = model(x)
+                p = torch.softmax(out, dim=1)
+                probs.append(p.cpu().numpy())
+
+        all_scaled_probs.append(np.concatenate(probs, axis=0))
+
+        # Restore original circuit
+        model.quantum_layer.quantum_circuit = original_circuit
+
+    # Richardson extrapolation to zero noise
+    all_scaled_probs = np.array(all_scaled_probs)  # [n_scales, n_samples, n_classes]
+    zne_probs = np.zeros_like(all_scaled_probs[0])
+
+    for i in range(all_scaled_probs.shape[1]):  # per sample
+        for c in range(all_scaled_probs.shape[2]):  # per class
+            values = all_scaled_probs[:, i, c]
+            # Linear Richardson extrapolation
+            zne_probs[i, c] = richardson_extrapolate(scale_factors, values)
+
+    return zne_probs
+
+
 class NoisyQuantumLayer(nn.Module):
     """Quantum layer with realistic noise simulation."""
     
@@ -292,7 +376,8 @@ def train_quantum_hybrid_pennylane_noisy(dataset_file="hymenoptera", classical_m
                                        n_qubits=4, quantum_depth=3, epochs=20, id="null",
                                        batch_size=32, learning_rate=1e-3, early_stop_patience=10,
                                        gamma=0.9, noise_type='realistic_ibm', backend='ibm_nairobi',
-                                       seed=42, output_dir=None):
+                                       seed=42, output_dir=None,
+                                       use_zne=True, zne_scale_factors=None):
     set_seed(seed)
     print("============================================================")
     print("PennyLane Noisy Quantum Transfer Learning")
@@ -307,6 +392,11 @@ def train_quantum_hybrid_pennylane_noisy(dataset_file="hymenoptera", classical_m
     print(f"Noise type: {noise_type}")
     if noise_type == 'realistic_ibm':
         print(f"Backend: {backend}")
+    if zne_scale_factors is None:
+        zne_scale_factors = [1.0, 2.0, 3.0]
+    print(f"ZNE enabled: {use_zne}")
+    if use_zne:
+        print(f"ZNE scale factors: {zne_scale_factors}")
     print(f"ID: {id}")
     print("============================================================")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -483,7 +573,36 @@ def train_quantum_hybrid_pennylane_noisy(dataset_file="hymenoptera", classical_m
     test_time = time.time() - start_time_test
     print(f"Test Acc: {test_acc:.4f}")
     print(f"Training time: {train_time:.2f}s, Testing time: {test_time:.2f}s")
-    
+
+    # Zero-Noise Extrapolation (ZNE)
+    zne_acc = 0.0
+    zne_precision = 0.0
+    zne_recall = 0.0
+    zne_f1 = 0.0
+    zne_applied = False
+    if use_zne and noise_params is not None:
+        print("Applying Zero-Noise Extrapolation (ZNE)...")
+        print(f"  Scale factors: {zne_scale_factors}")
+        zne_probs = apply_zne_to_predictions(
+            model, test_loader, noise_params, n_qubits, quantum_depth,
+            zne_scale_factors, device, num_classes
+        )
+        # Collect true labels for ZNE evaluation
+        zne_y_true = []
+        for _, y in test_loader:
+            zne_y_true.extend(y.tolist())
+        zne_y_true = np.array(zne_y_true)
+        zne_preds = np.argmax(zne_probs, axis=1)
+        zne_acc = np.mean(zne_preds == zne_y_true)
+        zne_precision = precision_score(zne_y_true, zne_preds, average='weighted', zero_division=0)
+        zne_recall = recall_score(zne_y_true, zne_preds, average='weighted', zero_division=0)
+        zne_f1 = f1_score(zne_y_true, zne_preds, average='weighted', zero_division=0)
+        zne_applied = True
+        print(f"ZNE Test Accuracy: {zne_acc:.4f} (vs raw: {test_acc:.4f})")
+        print(f"ZNE Precision: {zne_precision:.4f}, Recall: {zne_recall:.4f}, F1: {zne_f1:.4f}")
+    elif use_zne and noise_params is None:
+        print("ZNE requested but no noise params available (noiseless mode). Skipping ZNE.")
+
     print("Step 8/8: Saving model and comprehensive metrics...")
     # Save model
     os.makedirs('model_saved', exist_ok=True)
@@ -665,7 +784,12 @@ def train_quantum_hybrid_pennylane_noisy(dataset_file="hymenoptera", classical_m
         'co2_kg': co2_kg,
         'epochs_actual': len(train_losses),
         'loss_history': json.dumps(train_losses),
-        'val_acc_history': json.dumps(val_accs)
+        'val_acc_history': json.dumps(val_accs),
+        'zne_accuracy': zne_acc if zne_applied else '',
+        'zne_precision': zne_precision if zne_applied else '',
+        'zne_recall': zne_recall if zne_applied else '',
+        'zne_f1': zne_f1 if zne_applied else '',
+        'zne_scale_factors': json.dumps(zne_scale_factors) if zne_applied else ''
     }
 
     with open(csv_path, 'w', newline='') as f:
@@ -698,6 +822,12 @@ def main():
     parser.add_argument('--id', type=str, help='Run identifier (auto if not provided)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--output-dir', type=str, default=None, help='Output directory for results CSV')
+    parser.add_argument('--use-zne', action='store_true', default=True,
+                       help='Enable Zero-Noise Extrapolation (ZNE) for error mitigation (default: True)')
+    parser.add_argument('--no-zne', action='store_false', dest='use_zne',
+                       help='Disable Zero-Noise Extrapolation (ZNE)')
+    parser.add_argument('--zne-scale-factors', type=str, default='1.0,2.0,3.0',
+                       help='Comma-separated noise scale factors for ZNE (default: "1.0,2.0,3.0")')
 
     args = parser.parse_args()
     
@@ -706,6 +836,9 @@ def main():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.id = f"{args.model}_{args.n_qubits}q_depth{args.depth}_{timestamp}_noisy_pl"
     
+    # Parse ZNE scale factors
+    zne_scale_factors = [float(s) for s in args.zne_scale_factors.split(',')]
+
     # Train model
     test_acc, train_time, test_time = train_quantum_hybrid_pennylane_noisy(
         dataset_file=args.dataset,
@@ -721,7 +854,9 @@ def main():
         noise_type=args.noise_type,
         backend=args.backend,
         seed=args.seed,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        use_zne=args.use_zne,
+        zne_scale_factors=zne_scale_factors
     )
 
 if __name__ == "__main__":

@@ -240,6 +240,56 @@ def get_real_device_noise_model(n_qubits, backend_name='ibm_nairobi'):
     
     return noise_model
 
+
+def scale_noise_model(base_noise_model, scale_factor, n_qubits):
+    """Create a new noise model with scaled error rates."""
+    from qiskit_aer.noise import NoiseModel, thermal_relaxation_error, depolarizing_error, ReadoutError
+
+    scaled_model = NoiseModel()
+
+    # Scale thermal relaxation by reducing T1/T2 (more noise = shorter coherence)
+    t1_times = np.random.normal(120e-6, 20e-6, size=n_qubits)
+    t2_times = np.random.normal(80e-6, 15e-6, size=n_qubits)
+
+    gate_time_1q = 35e-9
+    gate_time_2q = 300e-9
+
+    for qubit in range(n_qubits):
+        # Reduce T1/T2 by scale_factor to increase noise
+        t1 = abs(t1_times[qubit]) / scale_factor
+        t2 = min(abs(t2_times[qubit]) / scale_factor, 2 * t1)
+
+        relax_1q = thermal_relaxation_error(t1, t2, gate_time_1q)
+        scaled_model.add_quantum_error(relax_1q, ['u1', 'u2', 'u3', 'ry', 'rz', 'sx', 'x'], [qubit])
+
+    for qubit in range(n_qubits - 1):
+        t1_q1 = abs(t1_times[qubit]) / scale_factor
+        t2_q1 = min(abs(t2_times[qubit]) / scale_factor, 2 * t1_q1)
+        t1_q2 = abs(t1_times[qubit+1]) / scale_factor
+        t2_q2 = min(abs(t2_times[qubit+1]) / scale_factor, 2 * t1_q2)
+
+        relax_2q = thermal_relaxation_error(t1_q1, t2_q1, gate_time_2q)
+        depol_2q = depolarizing_error(min(0.01 * scale_factor, 0.5), 2)
+        scaled_model.add_quantum_error(relax_2q.compose(depol_2q), ['cx'], [qubit, qubit+1])
+
+    for qubit in range(n_qubits):
+        p01 = min(np.random.uniform(0.01, 0.05) * scale_factor, 0.5)
+        p10 = min(np.random.uniform(0.01, 0.05) * scale_factor, 0.5)
+        readout_error = ReadoutError([[1-p01, p01], [p10, 1-p10]])
+        scaled_model.add_readout_error(readout_error, [qubit])
+
+    return scaled_model
+
+
+def richardson_extrapolate(scale_factors, values):
+    """Richardson extrapolation to zero noise."""
+    scale_factors = np.array(scale_factors)
+    values = np.array(values)
+    degree = min(len(scale_factors) - 1, 2)
+    coeffs = np.polyfit(scale_factors, values, degree)
+    return np.polyval(coeffs, 0.0)
+
+
 def build_quantum_qnn(n_qubits, quantum_depth, num_classes=2, noise_model=None):
     if BaseSampler is None:
         raise ImportError(f"Sampler could not be imported: {_SAMPLER_IMPORT_ERROR}")
@@ -325,7 +375,7 @@ def replace_classifier(model, model_name, quantum_head):
         raise ValueError("Unsupported model for quantum hybrid. Use 'resnet18', 'resnet34', 'vgg19', or 'mobilenetv2'.")
     return model
 
-def train_quantum_hybrid_qiskit_noisy(dataset_file="hymenoptera", classical_model="resnet18", n_qubits=4, quantum_depth=3, epochs=20, id="null", batch_size=32, learning_rate=0.001, gamma=0.9, backend_name='ibm_nairobi', seed=42, output_dir=None):
+def train_quantum_hybrid_qiskit_noisy(dataset_file="hymenoptera", classical_model="resnet18", n_qubits=4, quantum_depth=3, epochs=20, id="null", batch_size=32, learning_rate=0.001, gamma=0.9, backend_name='ibm_nairobi', seed=42, output_dir=None, use_zne=True, zne_scale_factors=None):
     """
     Train a quantum hybrid model with realistic noise from IBM quantum devices.
     """
@@ -476,6 +526,88 @@ def train_quantum_hybrid_qiskit_noisy(dataset_file="hymenoptera", classical_mode
     test_time = time.time() - start_test
     print(f"Test Accuracy: {test_acc:.2%}")
     print(f"Test Evaluation Time: {test_time:.2f} seconds")
+
+    # ---- Zero-Noise Extrapolation (ZNE) ----
+    # ZNE is applied post-training during evaluation only. The model is trained
+    # normally with the base noise. Then at test time, we evaluate at multiple
+    # noise scales and extrapolate to the zero-noise limit.
+    zne_accuracy = 0.0
+    zne_precision = 0.0
+    zne_recall = 0.0
+    zne_f1 = 0.0
+    zne_scales_str = ""
+
+    if use_zne:
+        if zne_scale_factors is None:
+            zne_scale_factors = [1.0, 2.0, 3.0]
+        zne_scales_str = ",".join(str(s) for s in zne_scale_factors)
+        print("============================================================")
+        print("Zero-Noise Extrapolation (ZNE) - Post-Training Evaluation")
+        print(f"Scale factors: {zne_scale_factors}")
+        print("============================================================")
+
+        # Store per-sample predictions at each noise scale
+        scale_accuracies = []
+        scale_precisions = []
+        scale_recalls = []
+        scale_f1s = []
+
+        for sf in zne_scale_factors:
+            print(f"  Evaluating at noise scale factor {sf}...")
+            # Build a quantum head with the scaled noise model
+            scaled_nm = scale_noise_model(noise_model, sf, n_qubits)
+            zne_quantum_head = QuantumNetTorch(
+                in_features, num_classes, n_qubits, quantum_depth, noise_model=scaled_nm
+            ).to(device)
+
+            # Copy trained weights into the new quantum head
+            zne_quantum_head.load_state_dict(quantum_head.state_dict())
+
+            # Temporarily replace classifier with the scaled-noise head
+            zne_model = copy.deepcopy(hybrid_model)
+            zne_model = replace_classifier(zne_model, classical_model, zne_quantum_head)
+            zne_model.eval()
+
+            zne_y_true, zne_y_pred = [], []
+            with torch.no_grad():
+                for x, y in test_loader:
+                    x = x.to(device)
+                    out = zne_model(x)
+                    _, pred = torch.max(out, 1)
+                    zne_y_true.extend(y.tolist())
+                    zne_y_pred.extend(pred.cpu().tolist())
+
+            sf_acc = np.mean(np.array(zne_y_true) == np.array(zne_y_pred))
+            sf_prec = precision_score(zne_y_true, zne_y_pred, average='weighted', zero_division=0)
+            sf_rec = recall_score(zne_y_true, zne_y_pred, average='weighted', zero_division=0)
+            sf_f1 = f1_score(zne_y_true, zne_y_pred, average='weighted', zero_division=0)
+
+            scale_accuracies.append(sf_acc)
+            scale_precisions.append(sf_prec)
+            scale_recalls.append(sf_rec)
+            scale_f1s.append(sf_f1)
+            print(f"    Scale {sf}: Acc={sf_acc:.4f}, Prec={sf_prec:.4f}, Rec={sf_rec:.4f}, F1={sf_f1:.4f}")
+
+        # Richardson extrapolation to zero noise
+        zne_accuracy = richardson_extrapolate(zne_scale_factors, scale_accuracies)
+        zne_precision = richardson_extrapolate(zne_scale_factors, scale_precisions)
+        zne_recall = richardson_extrapolate(zne_scale_factors, scale_recalls)
+        zne_f1 = richardson_extrapolate(zne_scale_factors, scale_f1s)
+
+        # Clip extrapolated values to [0, 1]
+        zne_accuracy = float(np.clip(zne_accuracy, 0.0, 1.0))
+        zne_precision = float(np.clip(zne_precision, 0.0, 1.0))
+        zne_recall = float(np.clip(zne_recall, 0.0, 1.0))
+        zne_f1 = float(np.clip(zne_f1, 0.0, 1.0))
+
+        improvement = (zne_accuracy - test_acc) * 100
+        sign = "+" if improvement >= 0 else ""
+        print("------------------------------------------------------------")
+        print(f"ZNE Accuracy:  {zne_accuracy:.4f} (vs raw: {test_acc:.4f}, improvement: {sign}{improvement:.2f}%)")
+        print(f"ZNE Precision: {zne_precision:.4f}")
+        print(f"ZNE Recall:    {zne_recall:.4f}")
+        print(f"ZNE F1:        {zne_f1:.4f}")
+        print("============================================================")
 
     print("Step 7/7: Saving model and comprehensive metrics...")
     
@@ -661,7 +793,12 @@ def train_quantum_hybrid_qiskit_noisy(dataset_file="hymenoptera", classical_mode
         'co2_kg': co2_kg,
         'epochs_actual': len(loss_hist),
         'loss_history': json.dumps(loss_hist),
-        'val_acc_history': json.dumps(acc_hist)
+        'val_acc_history': json.dumps(acc_hist),
+        'zne_accuracy': zne_accuracy,
+        'zne_precision': zne_precision,
+        'zne_recall': zne_recall,
+        'zne_f1': zne_f1,
+        'zne_scale_factors': zne_scales_str
     }
 
     with open(csv_path, 'w', newline='') as f:
@@ -690,6 +827,9 @@ def main():
     parser.add_argument('--id', type=str, help='Run identifier (auto if not provided)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--output-dir', type=str, default=None, help='Output directory for results CSV')
+    parser.add_argument('--use-zne', type=bool, default=True, help='Enable Zero-Noise Extrapolation during evaluation (default: True)')
+    parser.add_argument('--zne-scale-factors', type=str, default='1.0,2.0,3.0',
+                       help='Comma-separated noise scale factors for ZNE (default: "1.0,2.0,3.0")')
 
     args = parser.parse_args()
     
@@ -698,6 +838,9 @@ def main():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.id = f"{args.model}_{args.n_qubits}q_depth{args.depth}_{timestamp}_noisy"
     
+    # Parse ZNE scale factors from comma-separated string
+    zne_scale_factors = [float(s.strip()) for s in args.zne_scale_factors.split(',')]
+
     # Train model
     test_acc, train_time, test_time = train_quantum_hybrid_qiskit_noisy(
         dataset_file=args.dataset,
@@ -711,7 +854,9 @@ def main():
         gamma=args.gamma,
         backend_name=args.backend,
         seed=args.seed,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        use_zne=args.use_zne,
+        zne_scale_factors=zne_scale_factors
     )
 
 if __name__ == "__main__":
