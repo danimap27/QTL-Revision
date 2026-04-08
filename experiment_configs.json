@@ -56,10 +56,60 @@
     "learning_rate": 0.001,
     "quantum_configs": [
       {"n_qubits": 2, "quantum_depth": 2},
-      {"n_qubits": 4, "quantum_depth": 2}, 
+      {"n_qubits": 4, "quantum_depth": 2},
       {"n_qubits": 4, "quantum_depth": 3},
       {"n_qubits": 8, "quantum_depth": 3}
     ],
     "approaches": ["pennylane"]
+  },
+
+  "revision_full": {
+    "description": "Full revision experiments with 7 approaches, 5 seeds each",
+    "datasets": ["hymenoptera", "brain_tumor", "cats_dogs", "solar_dust"],
+    "models": ["resnet18", "mobilenetv2", "efficientnet_b0", "regnet_x_400mf"],
+    "epochs": 10,
+    "batch_size": 16,
+    "learning_rate": 0.001,
+    "n_qubits": 4,
+    "quantum_depth": 3,
+    "seeds": [42, 123, 456, 789, 1024],
+    "approaches": ["classical", "classical_mlp_matched", "classical_mlp_standard", "pennylane_ideal", "pennylane_noisy", "qiskit_ideal", "qiskit_noisy"]
+  },
+
+  "revision_ablation": {
+    "description": "Full qubit/depth ablation study for revision",
+    "datasets": ["hymenoptera", "brain_tumor"],
+    "models": ["resnet18"],
+    "epochs": 10,
+    "batch_size": 16,
+    "learning_rate": 0.001,
+    "qubit_range": [1, 2, 3, 4, 5, 6, 7, 8],
+    "depth_range": [1, 2, 3, 4, 5],
+    "seeds": [42, 123, 456, 789, 1024],
+    "approaches": ["pennylane"]
+  },
+
+  "revision_noise_decomposition": {
+    "description": "Isolated noise component analysis",
+    "datasets": ["hymenoptera"],
+    "models": ["resnet18"],
+    "epochs": 10,
+    "batch_size": 16,
+    "n_qubits": 4,
+    "quantum_depth": 3,
+    "seeds": [42, 123, 456, 789, 1024],
+    "noise_configs": ["ideal", "amplitude_only", "phase_only", "depolarizing_only", "full_noise"]
+  },
+
+  "revision_optimizer_control": {
+    "description": "Controlled optimizer comparison (SPSA vs parameter-shift)",
+    "datasets": ["hymenoptera", "brain_tumor"],
+    "models": ["resnet18", "mobilenetv2", "efficientnet_b0", "regnet_x_400mf"],
+    "epochs": 10,
+    "batch_size": 16,
+    "n_qubits": 4,
+    "quantum_depth": 3,
+    "seeds": [42, 123, 456, 789, 1024],
+    "approaches": ["pennylane_spsa"]
   }
 }

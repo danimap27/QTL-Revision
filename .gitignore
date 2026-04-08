@@ -158,3 +158,6 @@ emissions.csv
 aggregated_runs.csv
 notebook_runs.csv
 all_experiments_results.csv
+
+# Private revision tracking (NOT for GitHub)
+REVISION_TRACKER.md
