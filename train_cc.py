@@ -13,6 +13,25 @@ import os
 import argparse
 import numpy as np
 import datetime
+import random
+import json
+import csv
+try:
+    from codecarbon import EmissionsTracker
+    CODECARBON_AVAILABLE = True
+except ImportError:
+    CODECARBON_AVAILABLE = False
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
+
+
+def set_seed(seed):
+    """Set all random seeds for reproducibility."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 # Predefined datasets
 PREDEFINED_DATASETS = ['hymenoptera', 'brain_tumor', 'cats_dogs', 'solar_dust']
@@ -42,7 +61,8 @@ def resolve_dataset(dataset_name):
                 return dataset_name, n_classes
         raise ValueError(f"Dataset {dataset_name} not found")
 
-def train_classical(dataset_file="hymenoptera", classical_model="resnet18", epochs=5, id="null", batch_size=16, learning_rate=1e-4):
+def train_classical(dataset_file="hymenoptera", classical_model="resnet18", epochs=5, id="null", batch_size=16, learning_rate=1e-4, seed=42, output_dir=None):
+    set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print("============================================================")
@@ -92,14 +112,15 @@ def train_classical(dataset_file="hymenoptera", classical_model="resnet18", epoc
     
     train_size = int(0.8 * len(full_train_dataset))
     val_size = len(full_train_dataset) - train_size
-    train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size])
-    
+    generator = torch.Generator().manual_seed(seed)
+    train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size], generator=generator)
+
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
+
     num_classes = len(full_train_dataset.classes)
-    
+
     print("Step 2/7: Defining classical base model...")
     if classical_model.lower() == "resnet18":
         model = models.resnet18(pretrained=True)
@@ -146,6 +167,15 @@ def train_classical(dataset_file="hymenoptera", classical_model="resnet18", epoc
         return correct / total if total > 0 else 0.0
     
     print("Step 4/7: Starting training...")
+    if CODECARBON_AVAILABLE:
+        tracker = EmissionsTracker(
+            project_name=f"QTL_{id}",
+            output_dir=output_dir or "results/energy",
+            measure_power_secs=15,
+            tracking_mode="process",
+            log_level="warning"
+        )
+        tracker.start()
     start_train = time.time()
     for epoch in range(epochs):
         model.train()
@@ -298,6 +328,61 @@ def train_classical(dataset_file="hymenoptera", classical_model="resnet18", epoc
     print(f"Model saved as: CC_{id}_{classical_model}_{dataset_file}.pth")
     print(f"Plots saved in: {metrics_dir}")
 
+    # CodeCarbon stop
+    energy_kwh = 0.0
+    co2_kg = 0.0
+    if CODECARBON_AVAILABLE:
+        emissions = tracker.stop()
+        energy_kwh = tracker._total_energy.kWh if hasattr(tracker, '_total_energy') else 0.0
+        co2_kg = emissions if emissions else 0.0
+
+    # Save structured CSV
+    csv_dir = output_dir or "results/seeds"
+    os.makedirs(csv_dir, exist_ok=True)
+
+    approach = "classical"
+
+    precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+    recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+    try:
+        if num_classes == 2:
+            auc_roc = roc_auc_score(y_true, y_scores[:, 1] if isinstance(y_scores, np.ndarray) and y_scores.ndim > 1 else y_scores)
+        else:
+            auc_roc = roc_auc_score(y_true, y_scores, multi_class='ovr', average='weighted')
+    except:
+        auc_roc = 0.0
+
+    csv_filename = f"{approach}_{classical_model}_{dataset_file}_seed{seed}.csv"
+    csv_path = os.path.join(csv_dir, csv_filename)
+
+    row = {
+        'approach': approach,
+        'backbone': classical_model,
+        'dataset': dataset_file,
+        'seed': seed,
+        'n_qubits': 'NA',
+        'quantum_depth': 'NA',
+        'test_accuracy': test_acc,
+        'precision_weighted': precision,
+        'recall_weighted': recall,
+        'f1_weighted': f1,
+        'auc_roc_weighted': auc_roc,
+        'train_time_s': train_time,
+        'test_time_s': test_time,
+        'energy_kwh': energy_kwh,
+        'co2_kg': co2_kg,
+        'epochs_actual': len(loss_hist),
+        'loss_history': json.dumps(loss_hist),
+        'val_acc_history': json.dumps(acc_hist)
+    }
+
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        writer.writeheader()
+        writer.writerow(row)
+    print(f"Results saved to: {csv_path}")
+
     return test_acc, train_time, test_time
 
 # CLI Interface
@@ -309,6 +394,8 @@ def main():
     p.add_argument('--batch-size', type=int, default=16, help='Batch size')
     p.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     p.add_argument('--id', default=None, help='Run identifier (auto if not provided)')
+    p.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    p.add_argument('--output-dir', type=str, default=None, help='Output directory for results CSV')
     args = p.parse_args()
 
     # Generate ID if not provided
@@ -335,7 +422,9 @@ def main():
             epochs=args.epochs,
             id=args.id,
             batch_size=args.batch_size,
-            learning_rate=args.lr
+            learning_rate=args.lr,
+            seed=args.seed,
+            output_dir=args.output_dir
         )
         
         print("=" * 60)

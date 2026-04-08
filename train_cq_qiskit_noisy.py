@@ -20,6 +20,25 @@ import os
 import numpy as np
 import argparse
 from datetime import datetime
+import random
+import json
+import csv
+try:
+    from codecarbon import EmissionsTracker
+    CODECARBON_AVAILABLE = True
+except ImportError:
+    CODECARBON_AVAILABLE = False
+from sklearn.metrics import roc_auc_score
+
+
+def set_seed(seed):
+    """Set all random seeds for reproducibility."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 """train_cq_qiskit_noisy.py
 Version with realistic IBM Quantum backend noise for Qiskit >=1.x.
@@ -306,10 +325,11 @@ def replace_classifier(model, model_name, quantum_head):
         raise ValueError("Unsupported model for quantum hybrid. Use 'resnet18', 'resnet34', 'vgg19', or 'mobilenetv2'.")
     return model
 
-def train_quantum_hybrid_qiskit_noisy(dataset_file="hymenoptera", classical_model="resnet18", n_qubits=4, quantum_depth=3, epochs=20, id="null", batch_size=32, learning_rate=0.001, gamma=0.9, backend_name='ibm_nairobi'):
+def train_quantum_hybrid_qiskit_noisy(dataset_file="hymenoptera", classical_model="resnet18", n_qubits=4, quantum_depth=3, epochs=20, id="null", batch_size=32, learning_rate=0.001, gamma=0.9, backend_name='ibm_nairobi', seed=42, output_dir=None):
     """
     Train a quantum hybrid model with realistic noise from IBM quantum devices.
     """
+    set_seed(seed)
     print("============================================================")
     print("Qiskit Noisy Quantum Transfer Learning")
     print("============================================================")
@@ -354,7 +374,8 @@ def train_quantum_hybrid_qiskit_noisy(dataset_file="hymenoptera", classical_mode
     
     train_size = int(0.8*len(full_train_dataset))
     val_size = len(full_train_dataset) - train_size
-    train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size])
+    generator = torch.Generator().manual_seed(seed)
+    train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size], generator=generator)
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader= DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -394,6 +415,15 @@ def train_quantum_hybrid_qiskit_noisy(dataset_file="hymenoptera", classical_mode
     scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=gamma)
 
     print("Step 5/7: Starting training...")
+    if CODECARBON_AVAILABLE:
+        tracker = EmissionsTracker(
+            project_name=f"QTL_{id}",
+            output_dir=output_dir or "results/energy",
+            measure_power_secs=15,
+            tracking_mode="process",
+            log_level="warning"
+        )
+        tracker.start()
     loss_hist = []
     acc_hist = []
     def evaluate(loader):
@@ -584,6 +614,62 @@ def train_quantum_hybrid_qiskit_noisy(dataset_file="hymenoptera", classical_mode
     print(f"F1-score: {f1:.4f}")
     print("============================================================")
 
+    # CodeCarbon stop
+    energy_kwh = 0.0
+    co2_kg = 0.0
+    if CODECARBON_AVAILABLE:
+        emissions = tracker.stop()
+        energy_kwh = tracker._total_energy.kWh if hasattr(tracker, '_total_energy') else 0.0
+        co2_kg = emissions if emissions else 0.0
+
+    # Save structured CSV
+    csv_dir = output_dir or "results/seeds"
+    os.makedirs(csv_dir, exist_ok=True)
+
+    approach = "qiskit_noisy"
+
+    y_true_arr = np.array(y_true)
+    y_pred_arr = np.array(y_pred)
+    y_scores_arr = np.array(y_scores)
+
+    try:
+        if num_classes == 2:
+            auc_roc = roc_auc_score(y_true_arr, y_scores_arr)
+        else:
+            auc_roc = roc_auc_score(y_true_arr, y_scores_arr, multi_class='ovr', average='weighted')
+    except:
+        auc_roc = 0.0
+
+    csv_filename = f"{approach}_{classical_model}_{dataset_file}_seed{seed}.csv"
+    csv_path = os.path.join(csv_dir, csv_filename)
+
+    row = {
+        'approach': approach,
+        'backbone': classical_model,
+        'dataset': dataset_file,
+        'seed': seed,
+        'n_qubits': n_qubits,
+        'quantum_depth': quantum_depth,
+        'test_accuracy': test_acc,
+        'precision_weighted': precision,
+        'recall_weighted': recall,
+        'f1_weighted': f1,
+        'auc_roc_weighted': auc_roc,
+        'train_time_s': train_time,
+        'test_time_s': test_time,
+        'energy_kwh': energy_kwh,
+        'co2_kg': co2_kg,
+        'epochs_actual': len(loss_hist),
+        'loss_history': json.dumps(loss_hist),
+        'val_acc_history': json.dumps(acc_hist)
+    }
+
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        writer.writeheader()
+        writer.writerow(row)
+    print(f"Results saved to: {csv_path}")
+
     return test_acc, train_time, test_time
 
 def main():
@@ -602,7 +688,9 @@ def main():
                        choices=['ibm_nairobi', 'ibm_manila', 'ibm_lagos'],
                        help='IBM Quantum backend to simulate')
     parser.add_argument('--id', type=str, help='Run identifier (auto if not provided)')
-    
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    parser.add_argument('--output-dir', type=str, default=None, help='Output directory for results CSV')
+
     args = parser.parse_args()
     
     # Generate automatic ID if not provided
@@ -621,7 +709,9 @@ def main():
         batch_size=args.batch_size,
         learning_rate=args.lr,
         gamma=args.gamma,
-        backend_name=args.backend
+        backend_name=args.backend,
+        seed=args.seed,
+        output_dir=args.output_dir
     )
 
 if __name__ == "__main__":

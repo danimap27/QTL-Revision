@@ -22,6 +22,25 @@ import os
 import numpy as np
 import argparse
 from datetime import datetime
+import random
+import json
+import csv
+try:
+    from codecarbon import EmissionsTracker
+    CODECARBON_AVAILABLE = True
+except ImportError:
+    CODECARBON_AVAILABLE = False
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
+
+
+def set_seed(seed):
+    """Set all random seeds for reproducibility."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 from qiskit import QuantumCircuit
 from qiskit.circuit import Parameter
@@ -207,7 +226,9 @@ def replace_classifier(model, model_name: str, quantum_head: nn.Module):
 def train_quantum_hybrid_qiskit(dataset_file="hymenoptera", classical_model="resnet18", n_qubits=4, quantum_depth=3,
                                 epochs=20, id="null", batch_size=32, learning_rate=0.001, gamma=0.9,
                                 shots: int | None = None, use_noise: bool = False,
-                                noise_1q: float = 0.0, noise_2q: float = 0.0):
+                                noise_1q: float = 0.0, noise_2q: float = 0.0,
+                                seed=42, output_dir=None):
+    set_seed(seed)
     print("============================================================")
     print("Qiskit Quantum Transfer Learning")
     print("============================================================")
@@ -251,7 +272,8 @@ def train_quantum_hybrid_qiskit(dataset_file="hymenoptera", classical_model="res
     test_ds = datasets.ImageFolder(os.path.join(data_dir, "test"), transform=transform)
     train_size = int(0.8 * len(full_train))
     val_size = len(full_train) - train_size
-    train_ds, val_ds = random_split(full_train, [train_size, val_size])
+    generator = torch.Generator().manual_seed(seed)
+    train_ds, val_ds = random_split(full_train, [train_size, val_size], generator=generator)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
@@ -298,6 +320,15 @@ def train_quantum_hybrid_qiskit(dataset_file="hymenoptera", classical_model="res
         return correct / total if total else 0.0
 
     print("Step 5/7: Starting training...")
+    if CODECARBON_AVAILABLE:
+        tracker = EmissionsTracker(
+            project_name=f"QTL_{id}",
+            output_dir=output_dir or "results/energy",
+            measure_power_secs=15,
+            tracking_mode="process",
+            log_level="warning"
+        )
+        tracker.start()
     losses, val_accs, val_losses = [], [], []
     best_w, best_acc, best_ep = copy.deepcopy(hybrid.state_dict()), 0.0, 0
     t0 = time.time()
@@ -357,21 +388,83 @@ def train_quantum_hybrid_qiskit(dataset_file="hymenoptera", classical_model="res
     plt.figure(); plt.plot(range(1, epochs + 1), losses, label='Train Loss'); plt.plot(range(1, epochs + 1), val_losses, label='Val Loss'); plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("Loss"); plt.legend(); plt.savefig(os.path.join(metrics_dir, f"{id}_loss.png")); plt.close()
     plt.figure(); plt.plot(range(1, epochs + 1), val_accs); plt.xlabel("Epoch"); plt.ylabel("Val Acc"); plt.title("Val Acc"); plt.savefig(os.path.join(metrics_dir, f"{id}_acc.png")); plt.close()
 
-    y_true, y_pred = [], []
+    y_true, y_pred, y_scores = [], [], []
     hybrid.eval()
     with torch.no_grad():
         for xi, yi in test_loader:
             xi = xi.to(device)
             out = hybrid(xi)
+            probabilities = torch.softmax(out, dim=1)
             _, pr = torch.max(out, 1)
             y_true.extend(yi.tolist())
             y_pred.extend(pr.cpu().tolist())
+            y_scores.extend(probabilities.cpu().numpy())
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    y_scores = np.array(y_scores)
+
     cm = confusion_matrix(y_true, y_pred)
     disp = ConfusionMatrixDisplay(cm, display_labels=full_train.classes)
     disp.plot(); plt.title("Confusion Matrix"); plt.savefig(os.path.join(metrics_dir, f"{id}_confmat.png")); plt.close()
     # Print summary lists
     print('Val Loss per epoch:', [float(f"{v:.4f}") for v in val_losses])
     print('Val Acc  per epoch:', [float(f"{v:.4f}") for v in val_accs])
+
+    # CodeCarbon stop
+    energy_kwh = 0.0
+    co2_kg = 0.0
+    if CODECARBON_AVAILABLE:
+        emissions = tracker.stop()
+        energy_kwh = tracker._total_energy.kWh if hasattr(tracker, '_total_energy') else 0.0
+        co2_kg = emissions if emissions else 0.0
+
+    # Save structured CSV
+    csv_dir = output_dir or "results/seeds"
+    os.makedirs(csv_dir, exist_ok=True)
+
+    approach = "qiskit_ideal"
+
+    precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+    recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+    try:
+        if num_classes == 2:
+            auc_roc = roc_auc_score(y_true, y_scores[:, 1] if isinstance(y_scores, np.ndarray) and y_scores.ndim > 1 else y_scores)
+        else:
+            auc_roc = roc_auc_score(y_true, y_scores, multi_class='ovr', average='weighted')
+    except:
+        auc_roc = 0.0
+
+    csv_filename = f"{approach}_{classical_model}_{dataset_file}_seed{seed}.csv"
+    csv_path = os.path.join(csv_dir, csv_filename)
+
+    row = {
+        'approach': approach,
+        'backbone': classical_model,
+        'dataset': dataset_file,
+        'seed': seed,
+        'n_qubits': n_qubits,
+        'quantum_depth': quantum_depth,
+        'test_accuracy': test_acc,
+        'precision_weighted': precision,
+        'recall_weighted': recall,
+        'f1_weighted': f1,
+        'auc_roc_weighted': auc_roc,
+        'train_time_s': train_time,
+        'test_time_s': test_time,
+        'energy_kwh': energy_kwh,
+        'co2_kg': co2_kg,
+        'epochs_actual': len(losses),
+        'loss_history': json.dumps(losses),
+        'val_acc_history': json.dumps(val_accs)
+    }
+
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        writer.writeheader()
+        writer.writerow(row)
+    print(f"Results saved to: {csv_path}")
+
     return test_acc, train_time, test_time
 
 def _build_arg_parser():
@@ -389,6 +482,8 @@ def _build_arg_parser():
     p.add_argument('--noise-1q', type=float, default=0.001)
     p.add_argument('--noise-2q', type=float, default=0.01)
     p.add_argument('--id', default=None, help='Run identifier (auto-generated if not provided)')
+    p.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    p.add_argument('--output-dir', type=str, default=None, help='Output directory for results CSV')
     return p
 
 if __name__ == '__main__':
@@ -409,5 +504,7 @@ if __name__ == '__main__':
         shots=args.shots,
         use_noise=args.noise,
         noise_1q=args.noise_1q,
-        noise_2q=args.noise_2q
+        noise_2q=args.noise_2q,
+        seed=args.seed,
+        output_dir=args.output_dir
     )
